@@ -5,14 +5,45 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel, EmailStr, constr
+from passlib.context import CryptContext
+import secrets
 import os
 from pathlib import Path
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+
+# Password hashing context (bcrypt)
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# Simple in-memory user store (replace with DB in future)
+users: dict[str, dict] = {}
+
+# Simple CSRF token for demonstration (rotate in production)
+GLOBAL_CSRF_TOKEN = secrets.token_urlsafe(32)
+
+
+class RegisterModel(BaseModel):
+    email: EmailStr
+    password: constr(min_length=8)
+    full_name: str | None = None
+
+
+class LoginModel(BaseModel):
+    email: EmailStr
+    password: constr(min_length=8)
+
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
@@ -88,6 +119,44 @@ def get_activities():
     return activities
 
 
+@app.get("/auth/csrf-token")
+def get_csrf_token(response: Response):
+    """Return a CSRF token for clients to use in state-changing requests.
+
+    This is a minimal demo token. In production, use per-session tokens and
+    set them as secure cookies.
+    """
+    # also set as cookie for convenience
+    response.set_cookie(key="csrf_token", value=GLOBAL_CSRF_TOKEN, httponly=True)
+    return {"csrf_token": GLOBAL_CSRF_TOKEN}
+
+
+@app.post("/auth/register")
+def register(payload: RegisterModel, x_csrf_token: str | None = Header(None)):
+    # Basic CSRF check
+    if x_csrf_token != GLOBAL_CSRF_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token")
+
+    if payload.email in users:
+        raise HTTPException(status_code=400, detail="User already exists")
+
+    hashed = hash_password(payload.password)
+    users[payload.email] = {"email": payload.email, "password": hashed, "full_name": payload.full_name}
+    return {"message": "user registered", "email": payload.email}
+
+
+@app.post("/auth/login")
+def login(payload: LoginModel, x_csrf_token: str | None = Header(None)):
+    if x_csrf_token != GLOBAL_CSRF_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token")
+
+    user = users.get(payload.email)
+    if not user or not verify_password(payload.password, user["password"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    return {"message": "login successful", "email": payload.email}
+
+
 @app.post("/activities/{activity_name}/signup")
 def signup_for_activity(activity_name: str, email: str):
     """Sign up a student for an activity"""
@@ -98,14 +167,20 @@ def signup_for_activity(activity_name: str, email: str):
     # Get the specific activity
     activity = activities[activity_name]
 
+    # Validate email format using pydantic
+    try:
+        EmailStr.validate(email)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid email address")
+
+    # Enforce capacity
+    if len(activity["participants"]) >= activity.get("max_participants", 99999):
+        raise HTTPException(status_code=409, detail="Activity is full")
+
     # Validate student is not already signed up
     if email in activity["participants"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Student is already signed up"
-        )
+        raise HTTPException(status_code=400, detail="Student is already signed up")
 
-    # Add student
     activity["participants"].append(email)
     return {"message": f"Signed up {email} for {activity_name}"}
 
